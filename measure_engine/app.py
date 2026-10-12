@@ -1,0 +1,211 @@
+"""Orchestrator: camera ingestion loop, event handling, and pipeline wiring (PRD §6, §7)."""
+
+import sys
+import time
+
+import cv2
+
+from .config import Config
+from .hud import (
+    WINDOW_DASHBOARD,
+    WINDOW_MASK,
+    AlertBanner,
+    ViewState,
+    create_windows,
+    read_trackbars,
+    render,
+)
+from .recorder import Recorder
+from .tracker import CalibrationStatus, DimensionSmoother, ScaleCache
+from .vision import (
+    detect_marker,
+    find_target,
+    inside_guide,
+    is_clipped,
+    make_detector,
+    measure,
+    segment,
+    suppress_border_appendages,
+)
+
+
+def validate_save_gate(
+    status: CalibrationStatus,
+    target_present: bool,
+    target_clipped: bool,
+    outside_guide: bool,
+) -> tuple[bool, str]:
+    """Q8 Save Gate: returns (allowed, reason_if_rejected)."""
+    if status == CalibrationStatus.UNCALIBRATED:
+        return False, "NO CALIBRATION ANCHOR"
+    if not target_present:
+        return False, "NO TARGET DETECTED"
+    if target_clipped:
+        return False, "OBJECT CLIPPED"
+    if outside_guide:
+        return False, "OUTSIDE GUIDE BOX"
+    return True, ""
+
+
+def run(cap: cv2.VideoCapture | None = None, cfg: Config | None = None) -> None:
+    """Run the engine's main processing loop."""
+    cfg = cfg or Config()
+
+    created_cap = False
+    if cap is None:
+        cap = cv2.VideoCapture(cfg.camera_index, cv2.CAP_AVFOUNDATION)
+        created_cap = True
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
+        cap.set(cv2.CAP_PROP_FPS, cfg.target_fps)
+
+    if not cap.isOpened():
+        print(
+            "Grant camera access to your terminal/VS Code in "
+            "System Settings › Privacy & Security › Camera",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    act_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    act_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    act_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Camera opened: {act_w}x{act_h} @ {act_fps:.1f} FPS")
+
+    # Pipeline components
+    detector = make_detector(cfg)
+    scale_cache = ScaleCache(cfg)
+    smoother = DimensionSmoother(cfg)
+    recorder = Recorder(cfg=cfg)
+    alert = AlertBanner(duration_frames=cfg.banner_frames)
+
+    create_windows(cfg)
+    show_mask = cfg.show_mask_window
+
+    prev_time = time.time()
+    fps = float(cfg.target_fps)
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("Failed to grab frame from camera", file=sys.stderr)
+                break
+
+            now = time.time()
+            dt = now - prev_time
+            prev_time = now
+            if dt > 0:
+                fps = 0.9 * fps + 0.1 * (1.0 / dt)
+
+            tuning = read_trackbars(cfg)
+            smoother.alpha = tuning.alpha
+
+            # 1. Vision & Marker
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            marker = detect_marker(gray, detector, cfg.marker_id)
+            scale_cache.update(marker)
+
+            # 2. Outline Segmentation
+            seg_gray = (
+                suppress_border_appendages(frame, gray, cfg.min_hand_area_px, marker)
+                if cfg.suppress_hand_edges
+                else gray
+            )
+            k = cfg.blur_kernel
+            blurred = cv2.GaussianBlur(seg_gray, (k, k), cfg.blur_sigma)
+            mask = segment(blurred, tuning.canny_low, tuning.canny_high, cfg.close_kernel)
+
+            # 3. Target Detection
+            contour = find_target(
+                mask,
+                tuning.min_area,
+                scale_cache.last_marker,
+                cfg.marker_card_area_ratio,
+            )
+            target = measure(contour) if contour is not None else None
+            target_present = target is not None
+
+            # 4. Dimension Measurement & Smoothing
+            s = scale_cache.scale
+            raw_dims = (target.width_px * s, target.height_px * s) if (target and s) else None
+            smoothed_dims = smoother.update(raw_dims)
+
+            # 5. Boundary & Guide Box Checks
+            fshape = frame.shape
+            clipped = is_clipped(target.box, fshape, cfg.clip_margin_px) if target else False
+            target_inside = inside_guide(target.box, fshape, cfg.guide_fraction) if target else True
+            marker_inside = inside_guide(marker.corners, fshape, cfg.guide_fraction) if marker else True
+            outside_guide = not (target_inside and marker_inside)
+
+            # 6. View State & Render HUD
+            state = ViewState(
+                marker=marker,
+                scale=scale_cache.scale,
+                status=scale_cache.status,
+                cache_age=scale_cache.age,
+                target=target,
+                smoothed_dims=smoothed_dims,
+                target_present=target_present,
+                is_clipped=clipped,
+                is_outside_guide=outside_guide,
+                fps=fps,
+                alpha=smoother.alpha,
+            )
+
+            annotated_frame = render(frame, state, cfg, alert)
+            alert.tick()
+
+            cv2.imshow(WINDOW_DASHBOARD, annotated_frame)
+            if show_mask:
+                cv2.imshow(WINDOW_MASK, mask)
+
+            # 7. Key Handling
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):  # 'q' or ESC
+                break
+            elif key == ord("m"):
+                show_mask = not show_mask
+                if show_mask:
+                    cv2.namedWindow(WINDOW_MASK, cv2.WINDOW_AUTOSIZE)
+                    alert.trigger("MASK WINDOW ON", is_error=False)
+                else:
+                    try:
+                        cv2.destroyWindow(WINDOW_MASK)
+                    except cv2.error:
+                        pass
+                    alert.trigger("MASK WINDOW OFF", is_error=False)
+            elif key == ord("r"):
+                scale_cache.reset()
+                smoother.reset()
+                alert.trigger("TRACKER RESET", is_error=False)
+            elif key == ord("s"):
+                # Q8 Save Gate
+                allowed, reason = validate_save_gate(
+                    scale_cache.status, target_present, clipped, outside_guide
+                )
+                if allowed:
+                    w_cm, h_cm = smoothed_dims if smoothed_dims else raw_dims  # type: ignore[misc]
+                    assert target is not None
+                    assert scale_cache.scale is not None
+                    recorder.save(
+                        annotated_frame,
+                        w_cm,
+                        h_cm,
+                        target.width_px,
+                        target.height_px,
+                        scale_cache.scale,
+                        scale_cache.status,
+                    )
+                    alert.trigger("SNAPSHOT SAVED", is_error=False)
+                else:
+                    alert.trigger(f"CANNOT SAVE: {reason}", is_error=True)
+
+    finally:
+        if created_cap:
+            cap.release()
+        cv2.destroyAllWindows()
+
+
+def main() -> None:
+    run()
