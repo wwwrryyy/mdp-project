@@ -120,7 +120,7 @@ python3 -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install dependencies
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 ```
 
 ### 2. Generate the Reference Marker
@@ -157,11 +157,7 @@ The test suite includes 38 automated regression tests covering ArUco scale cachi
 ```
 mdp-project/
 ├── MDP - Smart Mirror.pptx   # Project presentation and architectural review
-├── PRD.md                    # Product Requirements Document & engineering spec
-├── CODING_STANDARDS.md       # Repository coding standards & architectural rules
-├── GLOSSARY.md               # Domain terminology and definitions
-├── requirements.txt          # Production runtime dependencies (opencv, numpy)
-├── requirements-dev.txt      # Development dependencies (pytest)
+├── requirements.txt          # Project dependencies (opencv, numpy, pytest)
 ├── docs/
 │   └── adr/
 │       └── 0001-perspective-rectification-and-handsfree-capture.md
