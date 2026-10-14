@@ -9,6 +9,7 @@ import cv2
 class Config:
     # Camera (PRD §1, G1)
     camera_index: int = 0
+    max_camera_probe: int = 5
     frame_width: int = 1280
     frame_height: int = 720
     target_fps: int = 30

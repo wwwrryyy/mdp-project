@@ -47,24 +47,22 @@ def validate_save_gate(
     return True, ""
 
 
+import platform
+import sys
+import cv2
+
 def run(cap: cv2.VideoCapture | None = None, cfg: Config | None = None) -> None:
     """Run the engine's main processing loop."""
     cfg = cfg or Config()
 
+    cam_index = cfg.camera_index
     created_cap = False
     if cap is None:
-        cap = cv2.VideoCapture(cfg.camera_index, cv2.CAP_AVFOUNDATION)
-        created_cap = True
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
-        cap.set(cv2.CAP_PROP_FPS, cfg.target_fps)
+        cap = open_camera(cam_index, cfg)
+        created_cap = cap is not None
 
-    if not cap.isOpened():
-        print(
-            "Grant camera access to your terminal/VS Code in "
-            "System Settings › Privacy & Security › Camera",
-            file=sys.stderr,
-        )
+    if cap is None or not cap.isOpened():
+        print("Error: Unable to access the camera.", file=sys.stderr)
         sys.exit(1)
 
     act_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -179,6 +177,20 @@ def run(cap: cv2.VideoCapture | None = None, cfg: Config | None = None) -> None:
                 scale_cache.reset()
                 smoother.reset()
                 alert.trigger("TRACKER RESET", is_error=False)
+            elif key == ord("n"):
+                result = switch_camera(cam_index, cfg)
+                if result is None:
+                    alert.trigger("NO OTHER CAMERA FOUND", is_error=True)
+                else:
+                    new_index, new_cap = result
+                    if created_cap:          # don't release a cap the caller gave us
+                        cap.release()
+                    cap, cam_index, created_cap = new_cap, new_index, True
+                    scale_cache.reset()      # different camera = different pixels-per-cm
+                    smoother.reset()
+                    prev_time = time.time()
+                    print(f"Switched to camera {cam_index}")
+                    alert.trigger(f"CAMERA {cam_index}", is_error=False)
             elif key == ord("s"):
                 # Q8 Save Gate
                 allowed, reason = validate_save_gate(
@@ -206,6 +218,40 @@ def run(cap: cv2.VideoCapture | None = None, cfg: Config | None = None) -> None:
             cap.release()
         cv2.destroyAllWindows()
 
+def _backend() -> int:
+    if platform.system() == "Windows":
+        return cv2.CAP_DSHOW
+    if platform.system() == "Darwin":
+        return cv2.CAP_AVFOUNDATION
+    return cv2.CAP_ANY
+
+
+def open_camera(index: int, cfg: Config) -> cv2.VideoCapture | None:
+    """Open camera `index`; return None if it doesn't exist or gives no frames."""
+    cap = cv2.VideoCapture(index, _backend())
+    if not cap.isOpened():
+        cap.release()
+        return None
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
+    cap.set(cv2.CAP_PROP_FPS, cfg.target_fps)
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        cap.release()
+        return None
+    return cap
+
+
+def switch_camera(current_index: int, cfg: Config) -> tuple[int, cv2.VideoCapture] | None:
+    """Find the next working camera after `current_index` (wraps around)."""
+    n = cfg.max_camera_probe
+    for step in range(1, n):
+        idx = (current_index + step) % n
+        cap = open_camera(idx, cfg)
+        if cap is not None:
+            return idx, cap
+    return None
 
 def main() -> None:
     run()
