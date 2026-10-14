@@ -47,24 +47,32 @@ def validate_save_gate(
     return True, ""
 
 
+import platform
+import sys
+import cv2
+
 def run(cap: cv2.VideoCapture | None = None, cfg: Config | None = None) -> None:
     """Run the engine's main processing loop."""
     cfg = cfg or Config()
 
     created_cap = False
     if cap is None:
-        cap = cv2.VideoCapture(cfg.camera_index, cv2.CAP_AVFOUNDATION)
+        # Automatically choose DirectShow on Windows, AVFoundation on macOS, or default
+        if platform.system() == "Windows":
+            backend = cv2.CAP_DSHOW
+        elif platform.system() == "Darwin":
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = cv2.CAP_ANY
+
+        cap = cv2.VideoCapture(cfg.camera_index, backend)
         created_cap = True
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
         cap.set(cv2.CAP_PROP_FPS, cfg.target_fps)
 
     if not cap.isOpened():
-        print(
-            "Grant camera access to your terminal/VS Code in "
-            "System Settings › Privacy & Security › Camera",
-            file=sys.stderr,
-        )
+        print("Error: Unable to access the camera.", file=sys.stderr)
         sys.exit(1)
 
     act_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
